@@ -183,7 +183,7 @@ kernel void matmul_grad_w(
     sum += a_mk * dy_mn;
   }
 
-  gradW[k * N + n] = sum;
+  gradW[k * N + n] = sum / float(M);
 }
 
 // grad_input: dA = dY @ Wᵗ
@@ -223,8 +223,8 @@ kernel void sgd_update(
 }
 
 kernel void relu_backward(
-  device const float *activation [[ buffer(0) ]],  // input to relu *before* activation
-  device float *grad [[ buffer(1) ]],              // gradient flowing into this layer (dL/dA)
+  device const float *activation [[ buffer(0) ]],  
+  device float *grad [[ buffer(1) ]],             
   uint id [[ thread_position_in_grid ]]
 ) {
   if (activation[id] <= 0.0f) {
@@ -243,5 +243,5 @@ kernel void bias_grad_sum(
   for (uint i = 0; i < batch_size; ++i) {
     sum += dL_dA[i * dim + id];
   }
-  grad_bias[id] = sum;
+  grad_bias[id] = sum / float(batch_size);
 }

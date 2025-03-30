@@ -349,8 +349,51 @@ float train(uint32_t batch_index) {
   // update linear1 weights
   launch_kernel("sgd_update", {mnist_model.linear1, gradW1, lr_buf},
                 MTLSizeMake(input_dim * hidden1, 1, 1), MTLSizeMake(64, 1, 1));
+  // update bias layers
+  // update bias3
+  {
+    id<MTLBuffer> grad_bias3 = [metal.device newBufferWithLength:output_dim * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> batch_buf = [metal.device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dim_buf = [metal.device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    uint32_t batch_size_u = 200; // batch_size
+    memcpy(batch_buf.contents, &batch_size_u, sizeof(uint32_t));
+    uint32_t d3 = output_dim;
+    memcpy(dim_buf.contents, &d3, sizeof(uint32_t));
+    launch_kernel("bias_grad_sum", {dL_dlogits, grad_bias3, batch_buf, dim_buf},
+                  MTLSizeMake(output_dim, 1, 1), MTLSizeMake(64, 1, 1));
+    launch_kernel("sgd_update", {mnist_model.bias3, grad_bias3, lr_buf},
+                  MTLSizeMake(output_dim, 1, 1), MTLSizeMake(64, 1, 1));
+  }
 
-  // note: bias updates not implemented yet—they follow similar pattern
+  // update bias2
+  {
+    id<MTLBuffer> grad_bias2 = [metal.device newBufferWithLength:hidden2 * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> batch_buf = [metal.device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dim_buf = [metal.device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    uint32_t batch_size_u = 200; // batch_size
+    memcpy(batch_buf.contents, &batch_size_u, sizeof(uint32_t));
+    uint32_t d2 = hidden2;
+    memcpy(dim_buf.contents, &d2, sizeof(uint32_t));
+    launch_kernel("bias_grad_sum", {dA2, grad_bias2, batch_buf, dim_buf},
+                  MTLSizeMake(hidden2, 1, 1), MTLSizeMake(64, 1, 1));
+    launch_kernel("sgd_update", {mnist_model.bias2, grad_bias2, lr_buf},
+                  MTLSizeMake(hidden2, 1, 1), MTLSizeMake(64, 1, 1));
+  }
+  
+  // update bias1
+  {
+    id<MTLBuffer> grad_bias1 = [metal.device newBufferWithLength:hidden1 * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> batch_buf = [metal.device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dim_buf = [metal.device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    uint32_t batch_size_u = 200; // batch_size
+    memcpy(batch_buf.contents, &batch_size_u, sizeof(uint32_t));
+    uint32_t d1 = hidden1;
+    memcpy(dim_buf.contents, &d1, sizeof(uint32_t));
+    launch_kernel("bias_grad_sum", {dA1, grad_bias1, batch_buf, dim_buf},
+                  MTLSizeMake(hidden1, 1, 1), MTLSizeMake(64, 1, 1));
+    launch_kernel("sgd_update", {mnist_model.bias1, grad_bias1, lr_buf},
+                 MTLSizeMake(hidden1, 1, 1), MTLSizeMake(64, 1, 1));
+ }
 
   return loss;
 }
