@@ -6,7 +6,7 @@ struct MatmulParams {
   uint K; // input dim
   uint N; // output dim
 };
-struct InitParams {uint32_t param_count, fan_in, fan_out; };
+struct InitParams { uint32_t param_count, fan_in, fan_out; };
 
 kernel void copy_batch(
   device const float *src [[ buffer(0) ]],
@@ -14,7 +14,11 @@ kernel void copy_batch(
   constant uint &offset [[ buffer(2) ]],
   uint id [[ thread_position_in_grid ]]
 ) {
-  dest[id] = src[offset * 784 + id];
+  // assumes batch data is contiguous in src after offset
+  // id = thread index within the batch copy (0 to batch_size * input_dim - 1)
+  // input_dim is implicitly 784 here.
+  uint src_idx = offset * 784 + id;
+  dest[id] = src[src_idx];
 }
 
 kernel void copy_batch_labels(
@@ -23,20 +27,21 @@ kernel void copy_batch_labels(
   constant uint &offset [[ buffer(2) ]],
   uint id [[ thread_position_in_grid ]]
 ) {
-  dest[id] = src[offset + id];
+  // id = thread index within the label copy (0 to batch_size - 1)
+  uint src_idx = offset + id;
+  dest[id] = src[src_idx];
 }
 
 kernel void normalize_image(
   device const uchar *in [[ buffer(0) ]],
   device float *out [[ buffer(1) ]],
-  uint id [[ thread_position_in_grid ]],
-  uint total_threads [[ threads_per_grid ]]
+  uint id [[ thread_position_in_grid ]] // use thread position directly
 ) {
-  for (uint i = id; i < 47040000; i += total_threads) {
-    out[i] = (float)(in[i]) / 255.0f;
-  }
+  // no loop needed if grid size == data size
+  out[id] = (float)(in[id]) / 255.0f;
 }
 
+// --- weight initialization ---
 inline uint lcg(uint x) {
   return x * 1664525u + 1013904223u;
 }
@@ -52,20 +57,24 @@ kernel void init_random_weights(
   uint total_threads [[ threads_per_grid ]]
 ) {
   const float bound = sqrt(6.0f / (params.fan_in + params.fan_out));
-  uint rng = lcg(id ^ 1234);
-  
+  uint rng = lcg(id ^ 1234); // reproducible fixed seed + id
+
+  // grid-stride loop
   for (uint i = id; i < params.param_count; i += total_threads) {
     rng = lcg(rng);
     float r = (rng & 0x00FFFFFF) / 16777216.0f;
     weights[i] = (r * 2.0f - 1.0f) * bound;
   }
 }
+// --- end weight initialization ---
 
+// modified relu: takes input and output buffers
 kernel void relu(
-  device float *weights [[ buffer(0) ]],
+  device const float *in_act [[ buffer(0) ]],
+  device float *out_act [[ buffer(1) ]],
   uint id [[ thread_position_in_grid ]]
 ) {
-    weights[id] = max(weights[id], 0.0f);
+  out_act[id] = max(in_act[id], 0.0f);
 }
 
 kernel void matmul(
@@ -79,18 +88,18 @@ kernel void matmul(
   uint K = params.K;
   uint N = params.N;
 
-  if (id >= M * N) return;
-
   uint i = id / N; // row index
-  int j = id % N;  // col index
+  uint j = id % N; // col index
+  if (i >= M) return;
 
   float sum = 0.0f;
   for (uint k = 0; k < K; ++k) {
-    float a_ik = a[i * K + k];
-    float b_kj = b[k * N + j];
-    sum += a_ik * b_kj;
+    uint a_idx = i * K + k;
+    uint b_idx = k * N + j;
+    sum += a[a_idx] * b[b_idx];
   }
-  c[i * N + j] = sum;
+  uint c_idx = i * N + j;
+  c[c_idx] = sum;
 }
 
 kernel void add_bias(
@@ -99,7 +108,8 @@ kernel void add_bias(
   constant uint &dim [[ buffer(2) ]],
   uint id [[ thread_position_in_grid ]]
 ) {
-  in_out[id] += bias[id % dim];
+  uint bias_idx = id % dim;
+  in_out[id] += bias[bias_idx];
 }
 
 kernel void softmax(
@@ -108,109 +118,95 @@ kernel void softmax(
   constant uint &output_dim [[ buffer(2) ]],
   uint id [[ thread_position_in_grid ]]
 ) {
-  // figure out which row we're in
   uint row = id / output_dim;
   uint col = id % output_dim;
   uint row_start = row * output_dim;
 
-  // first: find max for numerical stability
-  float maxval = logits[row_start];
-  for (uint i = 1; i < output_dim; ++i) {
-    float v = logits[row_start + i];
-    if (v > maxval) maxval = v;
+  float maxval = -INFINITY;
+  for (uint i = 0; i < output_dim; ++i) {
+    maxval = max(maxval, logits[row_start + i]);
   }
 
-  // compute exp(x - max)
   float denom = 0.0f;
   for (uint i = 0; i < output_dim; ++i) {
     denom += exp(logits[row_start + i] - maxval);
   }
 
-  // final softmax output
   probs[id] = exp(logits[id] - maxval) / denom;
 }
 
 kernel void cross_entropy_loss(
   device const float *softmax_output [[ buffer(0) ]],
   device const uchar *labels [[ buffer(1) ]],
-  device float *losses [[ buffer(2) ]], // per-sample losses
+  device float *losses [[ buffer(2) ]],
   constant uint &num_classes [[ buffer(3) ]],
   uint id [[ thread_position_in_grid ]]
 ) {
   uint label = labels[id];
-  float prob = softmax_output[id * num_classes + label];
-  losses[id] = -log(prob + 1e-8f); // prevent log(0)
+  uint prob_idx = id * num_classes + label;
+  float prob = max(softmax_output[prob_idx], 1e-9f);
+  losses[id] = -log(prob);
 }
 
 kernel void softmax_cross_entropy_backward(
-  device const float *softmax [[ buffer(0) ]],     // y_hat
-  device const uchar *labels [[ buffer(1) ]],      // y_true
-  device float *dL_dY [[ buffer(2) ]],             // output
+  device const float *softmax_probs [[ buffer(0) ]],
+  device const uchar *labels [[ buffer(1) ]],
+  device float *dL_dlogits [[ buffer(2) ]],
   constant uint &num_classes [[ buffer(3) ]],
   uint id [[ thread_position_in_grid ]]
 ) {
   uint row = id / num_classes;
   uint col = id % num_classes;
-  uint label = labels[row];
+  uint true_label = labels[row];
 
-  float grad = softmax[id];
-  if (col == label) grad -= 1.0f;
-
-  dL_dY[id] = grad;
+  float prob = softmax_probs[id];
+  float target = (col == true_label) ? 1.0f : 0.0f;
+  dL_dlogits[id] = prob - target;
 }
 
-// grad_w: W_grad = Aᵗ @ dL_dY
 kernel void matmul_grad_w(
-  device const float *A [[ buffer(0) ]],        // activations from layer 2
-  device const float *dL_dY [[ buffer(1) ]],    // softmax gradient
-  device float *gradW [[ buffer(2) ]],          // output: grad weights
+  device const float *A [[ buffer(0) ]],
+  device const float *dL_dY [[ buffer(1) ]],
+  device float *gradW [[ buffer(2) ]],
   constant MatmulParams &shape [[ buffer(3) ]],
   uint id [[ thread_position_in_grid ]]
 ) {
-  uint K = shape.K;  // input dim = 128
-  uint N = shape.N;  // output dim = 10
-  uint M = shape.M;  // batch size
-
-  if (id >= K * N) return;
+  uint K = shape.K;
+  uint N = shape.N;
+  uint M = shape.M;
 
   uint k = id / N;
   uint n = id % N;
 
+  if (k >= K) return;
+
   float sum = 0.0f;
   for (uint m = 0; m < M; ++m) {
-    float a_mk = A[m * K + k];
-    float dy_mn = dL_dY[m * N + n];
-    sum += a_mk * dy_mn;
+    sum += A[m * K + k] * dL_dY[m * N + n];
   }
-
-  gradW[k * N + n] = sum / float(M);
+  gradW[id] = sum / float(M);
 }
 
-// grad_input: dA = dY @ Wᵗ
 kernel void matmul_grad_input(
-  device const float *dY [[ buffer(0) ]],     // [B × N]
-  device const float *W [[ buffer(1) ]],      // [K × N]
-  device float *dA [[ buffer(2) ]],           // [B × K]
+  device const float *dY [[ buffer(0) ]],
+  device const float *W [[ buffer(1) ]],
+  device float *dA [[ buffer(2) ]],
   constant MatmulParams &shape [[ buffer(3) ]],
   uint id [[ thread_position_in_grid ]]
 ) {
-  uint M = shape.M;  // batch size
-  uint K = shape.K;  // input dim (128)
-  uint N = shape.N;  // output dim (10)
+  uint M = shape.M;
+  uint K = shape.K;
+  uint N = shape.N;
 
-  if (id >= M * K) return;
-
-  uint m = id / K;  // batch index
-  uint k = id % K;  // input dim index
+  uint m = id / K;
+  uint k = id % K;
+  if (m >= M) return;
 
   float sum = 0.0f;
   for (uint n = 0; n < N; ++n) {
-    float dy_mn = dY[m * N + n];
-    float w_kn = W[k * N + n];
-    sum += dy_mn * w_kn;
+    sum += dY[m * N + n] * W[k * N + n];
   }
-
-  dA[m * K + k] = sum;
+  dA[id] = sum;
 }
 
 kernel void sgd_update(
@@ -223,12 +219,12 @@ kernel void sgd_update(
 }
 
 kernel void relu_backward(
-  device const float *activation [[ buffer(0) ]],  
-  device float *grad [[ buffer(1) ]],             
+  device const float *pre_relu_activation [[ buffer(0) ]],
+  device float *grad_in_out [[ buffer(1) ]],
   uint id [[ thread_position_in_grid ]]
 ) {
-  if (activation[id] <= 0.0f) {
-    grad[id] = 0.0f;
+  if (pre_relu_activation[id] <= 0.0f) {
+    grad_in_out[id] = 0.0f;
   }
 }
 
@@ -239,6 +235,8 @@ kernel void bias_grad_sum(
   constant uint &dim [[ buffer(3) ]],
   uint id [[ thread_position_in_grid ]]
 ) {
+  if (id >= dim) return;
+
   float sum = 0.0f;
   for (uint i = 0; i < batch_size; ++i) {
     sum += dL_dA[i * dim + id];
