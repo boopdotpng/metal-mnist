@@ -17,3 +17,6 @@ $(TARGET): $(SRC)
 # Clean target
 clean:
 	rm -f $(TARGET)
+
+slow: slow.mm
+	$(CXX) $(CXXFLAGS) slow.mm $(INCLUDES) $(FRAMEWORKS) -o slow

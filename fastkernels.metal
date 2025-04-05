@@ -20,10 +20,12 @@ kernel void relu(
 
 // loss function
 
+// softmax + cross entropy loss kernel
 
 
 
 
+// backward softmax + cross entropy loss kernel
 
 // end loss function
 

@@ -222,7 +222,10 @@ struct linear {
   id<MTLBuffer> weights, bias;
   uint in_dim, out_dim;
   bool use_relu;
-  id<MTLBuffer> pre_act, post_act, dL_dout; // relu backward buffers
+  id<MTLBuffer> pre_act, post_act, dL_dout; // buffer to store activations
+
+  // buffers to store gradients (could be allocated in init or on demand)
+  id<MTLBuffer> gradW, gradB;
 
   linear(uint in_dim, uint out_dim, bool use_relu) : in_dim(in_dim), out_dim(out_dim), use_relu(use_relu) {}
 
@@ -230,6 +233,9 @@ struct linear {
     // TODO: zero init is fine for now, but use kaiming later
     weights = [metal.device newBufferWithLength:in_dim*out_dim*sizeof(float)  options:MTLResourceStorageModePrivate];
     bias = [metal.device newBufferWithLength:out_dim*sizeof(float)  options:MTLResourceStorageModePrivate];
+
+    gradW = alloc(in_dim * out_dim * sizeof(float));
+    gradB = alloc(out_dim * sizeof(float));
   }
 
   id<MTLBuffer> operator()(id<MTLBuffer> x) {
@@ -237,60 +243,168 @@ struct linear {
   }
 
   id<MTLBuffer> forward(id<MTLBuffer> input) {
+    // allocate pre_act; post_act points to different memory if relu is used
     pre_act = alloc(batch_size * out_dim * sizeof(float));
     post_act = use_relu ? alloc(batch_size * out_dim * sizeof(float)) : pre_act;
-
-    kernel_launch("matmul_bias") 
+    
+    // launch fused matmul+bias kernel; assume it writes to pre_act
+    kernel_launch("matmul_bias")
       .with_buffers({input, weights, bias, pre_act})
       .with_grid(MTLSizeMake(batch_size * out_dim, 1, 1))
       .with_block(MTLSizeMake(128, 1, 1));
-
+      
     if (use_relu) {
       kernel_launch("relu")
         .with_buffers({pre_act, post_act})
-        .with_grid(...)
-        .with_block(...);
+        .with_grid(MTLSizeMake(batch_size * out_dim, 1, 1))
+        .with_block(MTLSizeMake(128, 1, 1));
+      // return post-activation output
+      return post_act;
+    } else {
+      return pre_act;
     }
-
-    return post_act;
   }
-  void backward(id<MTLBuffer> input, id<MTLBuffer> dL_dout, id<MTLBuffer> &dL_din);
-  void update(float lr);
-  void relu() {
-   kernel_launch("relu")
-    .with_buffers()
-    .with_grid()
-    .with_block();
+  // backward pass: computes gradients and returns gradient wrt input
+  id<MTLBuffer> backward(id<MTLBuffer> input, id<MTLBuffer> dL_dout) {
+    // if relu was used, first launch relu_backward kernel
+    if (use_relu) {
+      // assume relu_backward takes pre_act and dL_dout, modifies dL_dout in-place
+      kernel_launch("relu_backward")
+        .with_buffers({pre_act, dL_dout})
+        .with_grid(MTLSizeMake(batch_size * out_dim, 1, 1))
+        .with_block(MTLSizeMake(128, 1, 1));
+    }
+    
+    // compute gradient w.r.t. weights: gradW = xᵀ @ dL_dz
+    kernel_launch("matmul_grad_w")
+      .with_buffers({input, dL_dout, gradW})
+      .with_grid(MTLSizeMake(in_dim * out_dim, 1, 1))
+      .with_block(MTLSizeMake(128, 1, 1));
+      
+    // compute gradient w.r.t. bias: gradB = sum(dL_dz, axis=0)
+    kernel_launch("bias_grad_sum")
+      .with_buffers({dL_dout, gradB})
+      .with_grid(MTLSizeMake(out_dim, 1, 1))
+      .with_block(MTLSizeMake(128, 1, 1));
+      
+    // compute gradient wrt input: dL_dx = dL_dz @ Wᵀ
+    id<MTLBuffer> dL_dx = alloc(batch_size * in_dim * sizeof(float));
+    kernel_launch("matmul_grad_input")
+      .with_buffers({dL_dout, weights, dL_dx})
+      .with_grid(MTLSizeMake(batch_size * in_dim, 1, 1))
+      .with_block(MTLSizeMake(128, 1, 1));
+    
+    return dL_dx;
+  }
+  void update(float lr) {
+    // update weights: weights -= lr * gradW
+    kernel_launch("sgd_update")
+      .with_buffers({weights, gradW, alloc(sizeof(float)) /* lr buffer */})
+      .with_grid(MTLSizeMake(in_dim * out_dim, 1, 1))
+      .with_block(MTLSizeMake(128, 1, 1));
+      
+    // update bias: bias -= lr * gradB
+    kernel_launch("sgd_update")
+      .with_buffers({bias, gradB, alloc(sizeof(float))})
+      .with_grid(MTLSizeMake(out_dim, 1, 1))
+      .with_block(MTLSizeMake(128, 1, 1));
   }
 };
 
 struct model {
   linear l1, l2, l3; 
-  id<MTLBuffer> relu1, relu2, logits, probs;
+  id<MTLBuffer> logits, probs, loss_buf;
 
   model() : l1(784, 512, true), l2(512, 128, true), l3(128, 10, false) {}
 
   void init() { 
     l1.init(); l2.init(); l3.init();
+    // allocate loss_buf for batch loss (float per sample)
+    loss_buf = alloc(batch_size * sizeof(float));
    }
 
-  id<MTLBuffer> forward(id<MTLBuffer> x) {
-    id<MTLBuffer> x = l3(l2(l1(x)));
+  float forward(id<MTLBuffer> x, id<MTLBuffer> batch_labels) {
+    // chain forward passes
+    id<MTLBuffer> out1 = l1.forward(x);
+    id<MTLBuffer> out2 = l2.forward(out1);
+    logits = l3.forward(out2);
+    
+    // launch softmax + cross entropy kernel to compute loss; writes to loss_buf
+    kernel_launch("softmax_cross_entropy")
+      .with_buffers({logits, batch_labels, loss_buf})
+      .with_grid(MTLSizeMake(batch_size, 1, 1))
+      .with_block(MTLSizeMake(128, 1, 1));
+      
+    // flush all queued kernels (forward pass + loss computation)
+    metal.run_all();
+    
+    // blit loss_buf (which is in private mode) to a shared staging buffer for CPU readback
+    id<MTLBuffer> staging_loss = alloc(batch_size * sizeof(float));
+    id<MTLCommandBuffer> cmd = [metal.queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+    [blit copyFromBuffer:loss_buf sourceOffset:0 toBuffer:staging_loss destinationOffset:0 size:batch_size*sizeof(float)];
+    [blit endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    
+    // read and average loss
+    float *losses = (float *)[staging_loss contents];
+    float sum_loss = 0;
+    for (uint32_t i = 0; i < batch_size; ++i)
+      sum_loss += losses[i];
+    return sum_loss / batch_size;
+  }
+  
+  // backward pass: assume loss gradient is computed from the loss function kernel
+  void backward(id<MTLBuffer> x, id<MTLBuffer> batch_labels) {
+    // launch softmax cross entropy backward kernel to get dL/dlogits
+    id<MTLBuffer> dL_dlogits = alloc(batch_size * 10 * sizeof(float));
+    kernel_launch("softmax_cross_entropy_backward")
+      .with_buffers({logits, batch_labels, dL_dlogits})
+      .with_grid(MTLSizeMake(batch_size * 10, 1, 1))
+      .with_block(MTLSizeMake(128, 1, 1));
+      
+    metal.run_all();
+    
+    // backprop through l3, l2, l1 in sequence
+    id<MTLBuffer> dL_dout_l3 = l3.backward(l2.post_act, dL_dlogits);
+    id<MTLBuffer> dL_dout_l2 = l2.backward(l1.post_act, dL_dout_l3);
+    // we could compute dL/dx for l1, but often it's not needed
+    l1.backward(x, dL_dout_l2);
+    
     metal.run_all();
   }
-
-  void backward() { 
-
+  
+  void step(float lr) {
+    l1.update(lr);
+    l2.update(lr);
+    l3.update(lr);
+    metal.run_all();
   }
 };
 
-void one_train() {}
+void train_epoch(model &m, MNIST &dataset) {
+  // assume dataset provides a way to get batch input and labels, e.g. via kernels
+  // here, we use placeholder functions get_batch_x and get_batch_y that return id<MTLBuffer>
+  for (uint32_t batch = 0; batch < MNIST::TRAIN_CT / batch_size; ++batch) {
+    id<MTLBuffer> batch_x = /* get batch from dataset.x_train using a copy kernel */;
+    id<MTLBuffer> batch_y = /* get batch from dataset.y_train using a copy kernel */;
+    
+    float loss = m.forward(batch_x, batch_y);
+    printf("batch %u loss: %f\n", batch, loss);
+    
+    m.backward(batch_x, batch_y);
+    m.update(0.01f);  // update with learning rate 0.01
+  }
+}
 
 int main(int argc, char *argv[]) {
   metal.init();
   dataset.init();
   model m;
   m.init();
+  // run one epoch 
+  train_epoch(m, dataset);
   printf("help\n");
   return 0;
 }
