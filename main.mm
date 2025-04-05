@@ -9,10 +9,10 @@
 #include <Foundation/Foundation.h>
 #include <Metal/Metal.h>
 #include <chrono>
-#include <unordered_map> // Include missing header
-#include <string>        // Include missing header
-#include <vector>        // Include missing header (though initializer_list is used)
-
+#include <stdio.h>
+#include <unordered_map> 
+#include <string>        
+#include <vector>        
 
 using namespace std;
 
@@ -342,7 +342,7 @@ void load_labels(const string &filename, id<MTLBuffer> buffer, uint32_t expected
 
 
 float train(uint32_t batch_index) {
-  const uint32_t batch_size = 200;
+  const uint32_t batch_size = 500;
   // Use dimensions from model struct
   const uint32_t input_dim = mnist_model.input_dim;
   const uint32_t hidden1 = mnist_model.hidden1;
@@ -573,17 +573,108 @@ float train(uint32_t batch_index) {
   return loss;
 }
 
+int predict_batch(uint32_t batch_index) {
+  const uint32_t test_batch_size = 500;
+  const uint32_t input_dim = mnist_model.input_dim;
+  const uint32_t hidden1 = mnist_model.hidden1;
+  const uint32_t hidden2 = mnist_model.hidden2;
+  const uint32_t output_dim = mnist_model.output_dim;
+
+  // copy test batch data
+  id<MTLBuffer> batch = [metal.device newBufferWithLength:test_batch_size * input_dim * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+  id<MTLBuffer> true_labels = [metal.device newBufferWithLength:test_batch_size * sizeof(unsigned char)
+                                                      options:MTLResourceStorageModeShared];
+  id<MTLBuffer> offset_buf = [metal.device newBufferWithLength:sizeof(uint32_t)
+                                                      options:MTLResourceStorageModeShared];
+  uint32_t offset = batch_index * test_batch_size;
+  memcpy(offset_buf.contents, &offset, sizeof(uint32_t));
+  launch_kernel("copy_batch", {mnist.xtest, batch, offset_buf},
+                MTLSizeMake(test_batch_size * input_dim, 1, 1), MTLSizeMake(256, 1, 1));
+  launch_kernel("copy_batch_labels", {mnist.ytest, true_labels, offset_buf},
+                MTLSizeMake(test_batch_size, 1, 1), MTLSizeMake(256, 1, 1));
+
+  // allocate reusable buffers
+  id<MTLBuffer> shape_buf = [metal.device newBufferWithLength:sizeof(MatmulParams)
+                                                     options:MTLResourceStorageModeShared];
+  id<MTLBuffer> bias_dim_buf = [metal.device newBufferWithLength:sizeof(uint32_t)
+                                                        options:MTLResourceStorageModeShared];
+
+  // layer 1: batch * 784 -> batch * hidden1
+  id<MTLBuffer> buf1_pre_relu = [metal.device newBufferWithLength:test_batch_size * hidden1 * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+  id<MTLBuffer> buf1_relu = [metal.device newBufferWithLength:test_batch_size * hidden1 * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+  MatmulParams shape1 = {test_batch_size, input_dim, hidden1};
+  memcpy(shape_buf.contents, &shape1, sizeof(shape1));
+  launch_kernel("matmul", {batch, mnist_model.linear1, buf1_pre_relu, shape_buf},
+                MTLSizeMake(test_batch_size * hidden1, 1, 1), MTLSizeMake(128, 1, 1));
+  uint32_t d1 = hidden1;
+  memcpy(bias_dim_buf.contents, &d1, sizeof(d1));
+  launch_kernel("add_bias", {buf1_pre_relu, mnist_model.bias1, bias_dim_buf},
+                MTLSizeMake(test_batch_size * hidden1, 1, 1), MTLSizeMake(128, 1, 1));
+  launch_kernel("relu", {buf1_pre_relu, buf1_relu},
+                MTLSizeMake(test_batch_size * hidden1, 1, 1), MTLSizeMake(128, 1, 1));
+
+  // layer 2: batch * hidden1 -> batch * hidden2
+  id<MTLBuffer> buf2_pre_relu = [metal.device newBufferWithLength:test_batch_size * hidden2 * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+  id<MTLBuffer> buf2_relu = [metal.device newBufferWithLength:test_batch_size * hidden2 * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+  MatmulParams shape2 = {test_batch_size, hidden1, hidden2};
+  memcpy(shape_buf.contents, &shape2, sizeof(shape2));
+  launch_kernel("matmul", {buf1_relu, mnist_model.linear2, buf2_pre_relu, shape_buf},
+                MTLSizeMake(test_batch_size * hidden2, 1, 1), MTLSizeMake(128, 1, 1));
+  uint32_t d2 = hidden2;
+  memcpy(bias_dim_buf.contents, &d2, sizeof(d2));
+  launch_kernel("add_bias", {buf2_pre_relu, mnist_model.bias2, bias_dim_buf},
+                MTLSizeMake(test_batch_size * hidden2, 1, 1), MTLSizeMake(128, 1, 1));
+  launch_kernel("relu", {buf2_pre_relu, buf2_relu},
+                MTLSizeMake(test_batch_size * hidden2, 1, 1), MTLSizeMake(128, 1, 1));
+
+  // layer 3: batch * hidden2 -> batch * output_dim
+  id<MTLBuffer> logits = [metal.device newBufferWithLength:test_batch_size * output_dim * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+  MatmulParams shape3 = {test_batch_size, hidden2, output_dim};
+  memcpy(shape_buf.contents, &shape3, sizeof(shape3));
+  launch_kernel("matmul", {buf2_relu, mnist_model.linear3, logits, shape_buf},
+                MTLSizeMake(test_batch_size * output_dim, 1, 1), MTLSizeMake(128, 1, 1));
+  uint32_t d3 = output_dim;
+  memcpy(bias_dim_buf.contents, &d3, sizeof(d3));
+  launch_kernel("add_bias", {logits, mnist_model.bias3, bias_dim_buf},
+                MTLSizeMake(test_batch_size * output_dim, 1, 1), MTLSizeMake(128, 1, 1));
+
+  // softmax for probabilities
+  id<MTLBuffer> probs = [metal.device newBufferWithLength:test_batch_size * output_dim * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+  launch_kernel("softmax", {logits, probs, bias_dim_buf},
+                MTLSizeMake(test_batch_size * output_dim, 1, 1), MTLSizeMake(128, 1, 1));
+
+  // compute predictions on cpu by argmax over softmax output
+  float *probs_ptr = (float *)probs.contents;
+  unsigned char *labels_ptr = (unsigned char *)true_labels.contents;
+  int correct = 0;
+  for (uint32_t i = 0; i < test_batch_size; ++i) {
+    int best = 0;
+    float best_val = probs_ptr[i * output_dim];
+    for (uint32_t j = 1; j < output_dim; ++j) {
+      float val = probs_ptr[i * output_dim + j];
+      if (val > best_val) { best_val = val; best = j; }
+    }
+    if (best == labels_ptr[i]) correct++;
+  }
+  return correct;
+}
+
 int main(void) {
- @autoreleasepool { // Good practice for Obj-C objects
+ @autoreleasepool {
     try {
         metal.init();
         mnist.init(metal.device);
-        mnist_model.init(); // Init model dimensions before loading
+        mnist_model.init(); // init model dimensions before loading
 
-        // --- Load Data ---
-        // Ensure the paths are correct relative to your executable
-        // Or provide absolute paths.
-        const string data_path = "./mnist/"; // Adjust if needed
+        // --- load data ---
+        const string data_path = "./mnist/"; // adjust if needed
         uint32_t num_images_train, rows_train, cols_train, num_labels_train;
         uint32_t num_images_test, rows_test, cols_test, num_labels_test;
 
@@ -592,52 +683,53 @@ int main(void) {
         load_images(data_path + "t10k-images.idx3-ubyte", mnist.xtest_un, mnist.test_count, num_images_test, rows_test, cols_test);
         load_labels(data_path + "t10k-labels.idx1-ubyte", mnist.ytest, mnist.test_count, num_labels_test);
 
-        mnist.normalize(); // Normalize after loading
+        mnist.normalize();
 
-        // --- Training Loop ---
-        const int batch_size = 200; // Must match the value in train()
+        // --- training loop ---
+        const int batch_size = 500; // must match the value in train()
         if (mnist.train_count == 0) {
-             throw runtime_error("Training data count is zero, cannot train.");
+             throw runtime_error("training data count is zero, cannot train.");
         }
         const int steps_per_epoch = mnist.train_count / batch_size;
-        const int num_epochs = 10; // Reduced for quicker testing initially
-
-        NSLog(@"Starting training: %d epochs, %d steps/epoch, batch size %d", num_epochs, steps_per_epoch, batch_size);
+        const int num_epochs = 10; // reduced for quicker testing initially
 
         for (int epoch = 0; epoch < num_epochs; ++epoch) {
             float epoch_loss = 0.0f;
-            Timer t; // Start timer for epoch
+            Timer t; // start timer for epoch
 
             for (int step = 0; step < steps_per_epoch; ++step) {
-                float batch_loss = train(step); // Pass step index
+                float batch_loss = train(step);
                 epoch_loss += batch_loss;
-
-                 if (step % 100 == 99 || step == steps_per_epoch - 1) { // Log every 100 steps and last step
-                     float avg_loss_so_far = epoch_loss / (step + 1);
-                     NSLog(@"[Epoch %d/%d] Step %d/%d | Batch Loss: %.4f | Avg Epoch Loss: %.4f",
-                           epoch + 1, num_epochs, step + 1, steps_per_epoch, batch_loss, avg_loss_so_far);
-                 }
             }
 
             double epoch_time_ms = t.elapsed_ms();
-             float avg_epoch_loss = epoch_loss / steps_per_epoch;
-            NSLog(@"[Epoch %d Done] Avg Loss = %.4f (%.2f ms, %.2f ms/step)",
-                  epoch + 1, avg_epoch_loss, epoch_time_ms, epoch_time_ms / steps_per_epoch);
-
-             // Optional: Add evaluation on test set here after each epoch
+            float avg_epoch_loss = epoch_loss / steps_per_epoch;
+            printf("[epoch %d done] avg loss = %.4f (%.2f ms)\n", epoch + 1, avg_epoch_loss, epoch_time_ms);
         }
 
-         NSLog(@"Training finished.");
+        printf("training finished.\n");
+
+
+        // validation accuracy 
+        Timer tv;
+        int total_correct = 0;
+        const int test_batch_size = 200;
+        int test_steps = mnist.test_count / test_batch_size;
+        for (int step = 0; step < test_steps; ++step) {
+          total_correct += predict_batch(step);
+        }
+        double validation_time_ms = tv.elapsed_ms();
+        float accuracy = total_correct / (float)mnist.test_count;
+        printf("validation: accuracy = %.2f%% (%.2f ms)\n", accuracy * 100, validation_time_ms);
+
 
     } catch (const std::exception &e) {
-        // Log standard exceptions using NSLog for consistency
-        NSString *errMsg = [NSString stringWithUTF8String:e.what()];
-        NSLog(@"Runtime Error: %@", errMsg);
+        fprintf(stderr, "runtime error: %s\n", e.what());
         return 1;
     } catch (...) {
-        NSLog(@"An unknown error occurred.");
-         return 1;
+        fprintf(stderr, "an unknown error occurred.\n");
+        return 1;
     }
- } // end @autoreleasepool
-  return 0;
+ }
+ return 0;
 }
