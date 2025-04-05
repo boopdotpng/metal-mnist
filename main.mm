@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <vector>
 
+static const uint32_t batch_size = 500;
+
 struct Timing {
   std::string label;
   std::chrono::steady_clock::time_point start;
@@ -87,6 +89,10 @@ struct metalcontext {
     NSLog(@"metal ok");
   }
 
+  id<MTLBuffer> alloc(uint size) {
+    return [device newBufferWithLength:size options:MTLResourceStorageModeShared];
+  }
+
   id<MTLComputePipelineState> get_pipeline(const char *name) {
     auto it = pipeline_cache.find(name);
     if (it != pipeline_cache.end()) return it->second;
@@ -127,6 +133,11 @@ uint32_t read_big_endian_uint32(std::ifstream &ifs) {
     throw std::runtime_error("failed to read 4 bytes from file stream.");
   return (uint32_t(bytes[0]) << 24) | (uint32_t(bytes[1]) << 16) |
          (uint32_t(bytes[2]) << 8) | uint32_t(bytes[3]);
+}
+
+// helper: allocate a shared buffer (for CPU readback or temporary use)
+id<MTLBuffer> alloc(NSUInteger size) {
+  return [metal.device newBufferWithLength:size options:MTLResourceStorageModeShared];
 }
 
 struct MNIST {
@@ -208,26 +219,70 @@ struct MNIST {
 MNIST dataset;
 
 struct linear {
-  id<MTLBuffer> weights;
-  id<MTLBuffer> bias;
+  id<MTLBuffer> weights, bias;
+  uint in_dim, out_dim;
+  bool use_relu;
+  id<MTLBuffer> pre_act, post_act, dL_dout; // relu backward buffers
 
-  linear() {}
+  linear(uint in_dim, uint out_dim, bool use_relu) : in_dim(in_dim), out_dim(out_dim), use_relu(use_relu) {}
 
-  void init() { }
+  void init() {
+    // TODO: zero init is fine for now, but use kaiming later
+    weights = [metal.device newBufferWithLength:in_dim*out_dim*sizeof(float)  options:MTLResourceStorageModePrivate];
+    bias = [metal.device newBufferWithLength:out_dim*sizeof(float)  options:MTLResourceStorageModePrivate];
+  }
 
-  void forward() {}
+  id<MTLBuffer> operator()(id<MTLBuffer> x) {
+    return forward(x);
+  }
 
-  void backward() {}
+  id<MTLBuffer> forward(id<MTLBuffer> input) {
+    pre_act = alloc(batch_size * out_dim * sizeof(float));
+    post_act = use_relu ? alloc(batch_size * out_dim * sizeof(float)) : pre_act;
 
-  void update() {}
+    kernel_launch("matmul_bias") 
+      .with_buffers({input, weights, bias, pre_act})
+      .with_grid(MTLSizeMake(batch_size * out_dim, 1, 1))
+      .with_block(MTLSizeMake(128, 1, 1));
+
+    if (use_relu) {
+      kernel_launch("relu")
+        .with_buffers({pre_act, post_act})
+        .with_grid(...)
+        .with_block(...);
+    }
+
+    return post_act;
+  }
+  void backward(id<MTLBuffer> input, id<MTLBuffer> dL_dout, id<MTLBuffer> &dL_din);
+  void update(float lr);
+  void relu() {
+   kernel_launch("relu")
+    .with_buffers()
+    .with_grid()
+    .with_block();
+  }
 };
 
 struct model {
-  void init() { }
-  id<MTLBuffer> forward() { return nil; }
-};
+  linear l1, l2, l3; 
+  id<MTLBuffer> relu1, relu2, logits, probs;
 
-struct optim {};
+  model() : l1(784, 512, true), l2(512, 128, true), l3(128, 10, false) {}
+
+  void init() { 
+    l1.init(); l2.init(); l3.init();
+   }
+
+  id<MTLBuffer> forward(id<MTLBuffer> x) {
+    id<MTLBuffer> x = l3(l2(l1(x)));
+    metal.run_all();
+  }
+
+  void backward() { 
+
+  }
+};
 
 void one_train() {}
 

@@ -276,7 +276,7 @@ struct model {
     NSLog(@"Model initialized.");
   }
 };
-static model mnist_model;
+static ;
 
 // --- Data Loading (Mostly Unchanged, ensure paths are correct) ---
 uint32_t read_big_endian_uint32(ifstream &ifs) {
