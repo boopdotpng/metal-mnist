@@ -76,13 +76,11 @@ kernel void cross_entropy(
   loss_buf[b] = -log_prob;
 }
 
-
-// cross_entropy_backward: same dims, write dL_dlogits
 kernel void cross_entropy_backward(
   device const float *logits      [[ buffer(0) ]],
   device const uchar *labels      [[ buffer(1) ]],
   device       float *dL_dlogits  [[ buffer(2) ]],
-  constant     dims_t &dims        [[ buffer(3) ]],
+  constant     dims_t &dims         [[ buffer(3) ]],
   uint id [[ thread_position_in_grid ]]
 ) {
   uint C = dims.dout;
@@ -92,19 +90,21 @@ kernel void cross_entropy_backward(
   if (b >= dims.batch) return;
 
   device const float* row = logits + b * C;
-  // find max
+
   float m = row[0];
-  for (uint k = 1; k < C; ++k) m = fmax(row[k], m);
+  for (uint k = 1; k < C; ++k)
+    m = fmax(row[k], m);
 
   float denom = 0.0f;
   for (uint k = 0; k < C; ++k)
     denom += exp(row[k] - m);
 
   float prob = exp(row[j] - m) / denom;
-  if (j == labels[b]) prob -= 1.0f;
-  dL_dlogits[b * C + j] = prob / float(dims.batch);
-}
+  uint label = uint(labels[b]);
+  if (j == label) prob -= 1.0f;
 
+  dL_dlogits[b * C + j] = prob;  
+}
 
 kernel void matmul_grad_w (
   device float *input [[ buffer(0) ]],
@@ -123,7 +123,7 @@ kernel void matmul_grad_w (
     sum += x_val * grad;
   }
 
-  dW[i * dims.dout + j] = sum;
+  dW[i * dims.dout + j] = sum / float(dims.batch);
 }
 
 kernel void relu_backward(
@@ -151,7 +151,7 @@ kernel void bias_grad_sum (
     sum += dL_dout[b * Dout + j];
   }
 
-  dB[j] = sum;
+  dB[j] = sum / float(dims.batch);
 }
 
 kernel void matmul_grad_input(
@@ -180,15 +180,27 @@ kernel void matmul_grad_input(
   dL_dx[b * Din + i] = sum;
 }
 
-/*
-launch one thread per weight that needs to be updated
-*/
-kernel void sgd_update(
-  device float* p [[buffer(0)]],
-  device float *g [[ buffer(1) ]],
-  const device float* lr[[buffer(2)]],
-  uint id [[thread_position_in_grid]]
+// update weights: expects dim.din * dim.dout elements
+kernel void sgd_update_weight(
+  device float* p [[ buffer(0) ]],
+  device float* g [[ buffer(1) ]],
+  const device float* lr [[ buffer(2) ]],
+  constant dims_t &dims [[ buffer(3) ]],
+  uint id [[ thread_position_in_grid ]]
 ) {
+  if (id >= dims.din * dims.dout) return;
+  p[id] -= lr[0] * g[id];
+}
+
+// update biases: expects dim.dout elements
+kernel void sgd_update_bias(
+  device float* p [[ buffer(0) ]],
+  device float* g [[ buffer(1) ]],
+  const device float* lr [[ buffer(2) ]],
+  constant dims_t &dims [[ buffer(3) ]],
+  uint id [[ thread_position_in_grid ]]
+) {
+  if (id >= dims.dout) return;
   p[id] -= lr[0] * g[id];
 }
 
@@ -201,15 +213,6 @@ kernel void normalize_image(
   uint id [[ thread_position_in_grid ]] 
 ) {
   out[id] = (float)(in[id]) / 255.0f;
-}
-
-// layer init 
-// TODO: actually launch this kernel in the code
-kernel void fill_uniform(
-  device float *x [[ buffer(0) ]],
-  uint id [[ thread_position_in_grid ]]
-) {
-  x[id] = 0; // DO THIS LATER! 
 }
 
 // misc. 

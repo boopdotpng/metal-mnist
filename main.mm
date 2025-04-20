@@ -5,6 +5,7 @@
 #include <Metal/Metal.h>
 #include <stdio.h>
 #include <chrono>
+#include <cmath> 
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -13,6 +14,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <random>
 
 const uint32_t batch_size = 500;
 constexpr MTLSize default_block{128,1,1};
@@ -22,12 +24,17 @@ struct dims { uint32_t batch, din, dout; };
 struct Timing {
   std::string label;
   std::chrono::steady_clock::time_point start;
-  Timing(const char *label)
-      : label(label), start(std::chrono::steady_clock::now()) {}
-  ~Timing() {
-    auto end = std::chrono::steady_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(end - start).count();
-    printf("%s: %f ms\n", label.c_str(), ms);
+
+  Timing(const char *label) : label(label) {}
+
+  void begin() {
+    start = std::chrono::steady_clock::now();
+  }
+
+  void end() {
+    auto now = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(now - start).count();
+    printf("%s: %.3f ms\n", label.c_str(), ms);
   }
 };
 
@@ -122,7 +129,6 @@ struct metalcontext {
     for (auto &k : pending_kernels) {
       k.pipeline = get_pipeline(k.name);
       k.encode(enc);
-      printf("%s\n", k.name);
     }
 
     [enc endEncoding];
@@ -142,31 +148,6 @@ struct metalcontext {
     return shared;
   }
 }; metalcontext metal; 
-
-void print_buffer(id<MTLBuffer> buf, const char* label = "") {
-  id<MTLBuffer> cpu = metal.to_cpu(buf);
-  float *data = (float*)cpu.contents;
-  size_t count = buf.length / sizeof(float);
-
-  size_t show = 20;
-  size_t actual_head = std::min(show, count);
-  size_t actual_tail = std::min(show, count > show ? count - show : 0);
-
-  if (label && strlen(label) > 0)
-    printf("%s = [", label);
-  else
-    printf("[");
-
-  for (size_t i = 0; i < actual_head; ++i)
-    printf("%f, ", data[i]);
-
-  if (count > 2 * show)
-    printf("..., ");
-
-  for (size_t i = count - actual_tail; i < count; ++i)
-    printf("%f%s", data[i], (i == count - 1 ? "]\n" : ", "));
-}
-
 
 uint32_t read_big_endian_uint32(std::ifstream &ifs) {
   unsigned char bytes[4];
@@ -193,16 +174,14 @@ struct MNIST {
     uint32_t rows = read_big_endian_uint32(file);
     uint32_t cols = read_big_endian_uint32(file);
     size_t num_pixels = num_images * rows * cols;
-    size_t data_size = num_pixels * sizeof(unsigned char);
 
-    id<MTLBuffer> staging = [metal.device newBufferWithLength:data_size options:MTLResourceStorageModeShared];
-    void *staging_ptr = [staging contents];
-    if (!file.read((char *)staging_ptr, data_size))
+    id<MTLBuffer> staging = metal.alloc(num_pixels);
+    void *staging_ptr = staging.contents;
+    if (!file.read((char *)staging_ptr, num_pixels))
       throw std::runtime_error("failed to read image data from: " + filename);
 
     metal.enqueue("normalize_image", {staging, is_train ? x_train : x_test}, num_images * IMG_PIXELS);
     metal.run_all(); // staging goes out of scope
-    print_buffer(x_train);
     NSLog(@"loaded %u images", num_images);
   }
 
@@ -218,12 +197,11 @@ struct MNIST {
     uint32_t num_labels = read_big_endian_uint32(file);
     size_t data_size = num_labels * sizeof(unsigned char);
 
-    id<MTLBuffer> staging = [metal.device newBufferWithLength:data_size options:MTLResourceStorageModeShared];
-    void *staging_ptr = [staging contents];
+    id<MTLBuffer> staging = metal.alloc(data_size); 
+    void *staging_ptr = staging.contents; 
     if (!file.read((char *)staging_ptr, data_size))
       throw std::runtime_error("failed to read label data from: " + filename);
 
-    id<MTLBuffer> dest_buf = is_train ? y_train : y_test;
     id<MTLCommandBuffer> cmd = [metal.queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
     [blit copyFromBuffer:staging sourceOffset:0 toBuffer:is_train ? y_train : y_test destinationOffset:0 size:data_size];
@@ -267,6 +245,38 @@ struct linear {
 
     lr_buf = metal.alloc(sizeof(float));
     if (use_relu) relu_mask = metal.alloc_gpu(batch_size * out_dim * sizeof(char));
+
+    layer_init();
+  }
+
+  void layer_init() {
+    id<MTLBuffer> staging_w = metal.alloc(in_dim * out_dim * sizeof(float)); 
+    id<MTLBuffer> staging_b = metal.alloc(out_dim * sizeof(float));         
+    float* w_ptr = (float*)staging_w.contents;
+    float* b_ptr = (float*)staging_b.contents;
+
+    std::mt19937 gen(1337);
+    // std::mt19937 gen(std::chrono::system_clock::now().time_since_epoch().count()); 
+
+    float kaiming_bound_w = sqrtf(6.0f / in_dim);
+    std::uniform_real_distribution<float> dist_w(-kaiming_bound_w, kaiming_bound_w);
+    for (uint i = 0; i < in_dim * out_dim; ++i) {
+        w_ptr[i] = dist_w(gen);
+    }
+
+    float bias_bound = 1.0f / sqrtf(in_dim);
+    std::uniform_real_distribution<float> dist_b(-bias_bound, bias_bound);
+    for (uint i = 0; i < out_dim; ++i) {
+        b_ptr[i] = 0.0f; 
+    }
+
+    id<MTLCommandBuffer> cmd = [metal.queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+    [blit copyFromBuffer:staging_w sourceOffset:0 toBuffer:w destinationOffset:0 size:staging_w.length];
+    [blit copyFromBuffer:staging_b sourceOffset:0 toBuffer:b destinationOffset:0 size:staging_b.length];
+    [blit endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
   }
 
   id<MTLBuffer> forward(id<MTLBuffer> input) {
@@ -281,20 +291,20 @@ struct linear {
   }
 
   id<MTLBuffer> backward(id<MTLBuffer> dL_dout) {
-    if (use_relu) {
+    if (use_relu) 
       metal.enqueue("relu_backward", {relu_mask, dL_dout}, batch_size * out_dim);
-    }
-    metal.enqueue("matmul_grad_w", {input, dL_dout, dW, dims_buf}, in_dim * out_dim);
-    metal.enqueue("bias_grad_sum", {dL_dout, dB, dims_buf}, out_dim);
 
+    metal.enqueue("matmul_grad_w", {input, dL_dout, dW, dims_buf}, in_dim * out_dim);
+
+    metal.enqueue("bias_grad_sum", {dL_dout, dB, dims_buf}, out_dim);
     metal.enqueue("matmul_grad_input", {dL_dout, w, dL_dx, dims_buf}, batch_size * in_dim);
     return dL_dx;
   }
 
   void update(float lr) {
     *(float*)lr_buf.contents = lr;
-    metal.enqueue("sgd_update", {w, dW, lr_buf}, in_dim * out_dim);
-    metal.enqueue("sgd_update", {b, dB, lr_buf}, out_dim);
+    metal.enqueue("sgd_update_weight", {w, dW, lr_buf, dims_buf}, in_dim * out_dim);
+    metal.enqueue("sgd_update_bias", {b, dB, lr_buf, dims_buf}, out_dim);
   }
 
   void zero_grad() {
@@ -311,7 +321,7 @@ struct CrossEntropyLoss {
   CrossEntropyLoss(linear &lin) : lin(lin) {}
 
   void init() {
-    loss_buf = metal.alloc_gpu(batch_size * sizeof(float));
+    loss_buf = metal.alloc(batch_size * sizeof(float));
     dL_dlogits = metal.alloc_gpu(batch_size * lin.out_dim * sizeof(float));
     logits = lin.output;
     dims_buf = metal.alloc(sizeof(dims));
@@ -324,7 +334,7 @@ struct CrossEntropyLoss {
   }
 
   id<MTLBuffer> backward(id<MTLBuffer> labels) {
-    metal.enqueue("cross_entropy_backward", {logits, labels, dL_dlogits, dims_buf}, batch_size);
+    metal.enqueue("cross_entropy_backward", {logits, labels, dL_dlogits, dims_buf}, batch_size * lin.out_dim);
     return dL_dlogits;
   }
 
@@ -356,7 +366,8 @@ struct model {
     id<MTLBuffer> dL_dlogits = loss.backward(labels);
     id<MTLBuffer> dL2 = l3.backward(dL_dlogits);
     id<MTLBuffer> dL1 = l2.backward(dL2);
-    l1.backward(dL1);
+    id<MTLBuffer> dL0 = l1.backward(dL1);
+    // working
     
     // update
     l1.update(lr);
@@ -396,20 +407,28 @@ Batch get_batch(uint batch) {
   return b;
 }
 
-void train(model &m, MNIST &dataset, uint epoch) {
-  const float learning_rate = 0.01f;
-  for (uint32_t batch = 0; batch < MNIST::TRAIN_CT / batch_size; ++batch) {
-    Batch b = get_batch(batch);
-    print_buffer(b.x);
-    print_buffer(b.y);
-    id<MTLBuffer> loss = metal.to_cpu(m.run(b.x, b.y, learning_rate));
-    float *loss_cpu = (float*)loss.contents;
+void run_one(model &m, MNIST &dataset, float lr) {
     float sum = 0.0f;
-    for (int i = 0; i < batch_size; ++i) sum+=loss_cpu[i];
-    printf("%f\n", sum);
+    uint total_batches = MNIST::TRAIN_CT / batch_size;
+    uint total_samples = total_batches * batch_size;
 
-    break;
-  }
+    Timing timer("epoch");
+    timer.begin();
+    for (uint32_t batch = 0; batch < total_batches; ++batch) {
+        Batch b = get_batch(batch);
+        id<MTLBuffer> loss_buf = m.run(b.x, b.y, lr);
+        float *loss_cpu = (float*)loss_buf.contents;
+        for (int i = 0; i < batch_size; ++i)
+            sum += loss_cpu[i];
+    }
+    timer.end();
+    printf("epoch loss: %f\n", sum / total_samples);
+}
+
+void train(model &m, MNIST &dataset, uint epoch) {
+  // room for optimizer with this setup
+  const float lr = 0.01f;
+  for (uint8_t i = 0; i < epoch; i++) run_one(m, dataset, lr);
 }
 
 int main(int argc, char *argv[]) {
@@ -417,6 +436,6 @@ int main(int argc, char *argv[]) {
   dataset.init();
   model m;
   m.init();
-  train(m, dataset, 0);
+  train(m, dataset, 10);
   return 0;
 }
