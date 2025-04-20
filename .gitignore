@@ -2,3 +2,4 @@ metal-cpp
 main
 mnist
 main.dSYM
+*.trace
