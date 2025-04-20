@@ -52,30 +52,14 @@ struct metalcontext {
         throw runtime_error("Failed to create Metal command queue.");
     }
 
+     NSString *src = [NSString stringWithContentsOfFile:@"./slow/kernels.metal" encoding:NSUTF8StringEncoding error:nil];
+
     NSError *err = nil;
-    // Assuming kernels.metal is in the Resources folder of the application bundle
-    NSString *path = [[NSBundle mainBundle] pathForResource:@"kernels" ofType:@"metal"];
-    if (!path) {
-        // Fallback path (e.g., running from command line next to source)
-         path = @"kernels.metal";
-         NSLog(@"Warning: kernels.metal not found in bundle, trying local path: %@", path);
-    }
-
-    NSString *src = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
-    if (!src) {
-        NSLog(@"failed to read metal source at %@: %@", path, err);
-        throw runtime_error("metal source read failed");
-    }
-
-    MTLCompileOptions *options = [MTLCompileOptions new];
-    options.languageVersion = MTLLanguageVersion3_0; // Specify a language version
-
-    library = [device newLibraryWithSource:src options:options error:&err];
+    library = [device newLibraryWithSource:src options:nil error:&err];
     if (!library) {
-        NSLog(@"metal compile error: %@", err);
-        throw runtime_error("metal library compile failed");
+      NSLog(@"metal compile error: %@", err);
+      exit(1);
     }
-    NSLog(@"Metal library compiled successfully.");
   }
 };
 static metalcontext metal;

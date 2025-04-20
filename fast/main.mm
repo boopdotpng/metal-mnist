@@ -82,8 +82,7 @@ struct metalcontext {
     NSLog(@"using device %@", [device name]);
     queue = [device newCommandQueue];
 
-    NSString *path = [[NSBundle mainBundle] pathForResource:@"fastkernels" ofType:@"metal"];
-    NSString *src = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    NSString *src = [NSString stringWithContentsOfFile:@"./fast/kernels.metal" encoding:NSUTF8StringEncoding error:nil];
 
     NSError *err = nil;
     library = [device newLibraryWithSource:src options:nil error:&err];

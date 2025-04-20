@@ -1,22 +1,33 @@
-# Compiler and flags
+# Compiler and base flags
 CXX = clang++
-CXXFLAGS = -std=c++17 -ObjC++
+CXXFLAGS = -std=c++17 -ObjC++ -fobjc-arc
 INCLUDES = -I metal-cpp
+FRAMEWORKS = -framework Metal -framework Foundation
 
-# Frameworks
-FRAMEWORKS = -framework Metal -framework Foundation -fobjc-arc 
+# Determine build type
+ifeq ($(RELEASE),1)
+    OPTFLAGS = -O2
+else
+    OPTFLAGS = -g
+endif
 
-# Source and target
-SRC = main.mm
+# Output binary
 TARGET = main
 
-# Build target
-$(TARGET): $(SRC)
-	$(CXX) $(CXXFLAGS) $(SRC) $(INCLUDES) $(FRAMEWORKS) -o $(TARGET)
+.PHONY: all fast slow clean
 
-# Clean target
+# Default target
+all: fast
+
+# Fast build
+fast: fast/main.mm
+	$(CXX) $(CXXFLAGS) $< $(INCLUDES) $(FRAMEWORKS) $(OPTFLAGS) -o $(TARGET)
+
+# Slow build
+slow: slow/main.mm
+	$(CXX) $(CXXFLAGS) $< $(INCLUDES) $(FRAMEWORKS) $(OPTFLAGS) -o $(TARGET)
+
+# Clean
 clean:
 	rm -f $(TARGET)
 
-slow: slow.mm
-	$(CXX) $(CXXFLAGS) slow.mm $(INCLUDES) $(FRAMEWORKS) -o slow
