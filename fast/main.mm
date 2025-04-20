@@ -24,17 +24,10 @@ struct dims { uint32_t batch, din, dout; };
 struct Timing {
   std::string label;
   std::chrono::steady_clock::time_point start;
-
-  Timing(const char *label) : label(label) {}
-
-  void begin() {
-    start = std::chrono::steady_clock::now();
-  }
-
-  void end() {
+  void begin() { start = std::chrono::steady_clock::now(); }
+  double end() {
     auto now = std::chrono::steady_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(now - start).count();
-    printf("%s: %.3f ms\n", label.c_str(), ms);
+    return std::chrono::duration<double, std::milli>(now - start).count();
   }
 };
 
@@ -411,7 +404,7 @@ void run_one(model &m, MNIST &dataset, float lr) {
     uint total_batches = MNIST::TRAIN_CT / batch_size;
     uint total_samples = total_batches * batch_size;
 
-    Timing timer("epoch");
+    Timing timer;
     timer.begin();
     for (uint32_t batch = 0; batch < total_batches; ++batch) {
         Batch b = get_batch(batch);
@@ -420,12 +413,10 @@ void run_one(model &m, MNIST &dataset, float lr) {
         for (int i = 0; i < batch_size; ++i)
             sum += loss_cpu[i];
     }
-    timer.end();
-    printf("epoch loss: %f\n", sum / total_samples);
+    printf("epoch loss: %f, took %fms\n", sum / total_samples, timer.end());
 }
 
 void train(model &m, MNIST &dataset, uint epoch) {
-  // room for optimizer with this setup
   const float lr = 0.01f;
   for (uint8_t i = 0; i < epoch; i++) run_one(m, dataset, lr);
 }
