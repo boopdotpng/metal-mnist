@@ -3,6 +3,8 @@
 #define MTL_PRIVATE_IMPLEMENTATION
 #include <Foundation/Foundation.h>
 #include <Metal/Metal.h>
+#include <Metal/MTLCounters.h>
+#include <mach/mach_time.h> 
 #include <stdio.h>
 #include <chrono>
 #include <cmath> 
@@ -17,6 +19,7 @@
 #include <random>
 
 const uint32_t batch_size = 500;
+static bool profiling_enabled = getenv("PROFILE") != NULL;
 constexpr MTLSize default_block{128,1,1};
 
 struct dims { uint32_t batch, din, dout; };
@@ -25,16 +28,11 @@ struct Timing {
   std::string label;
   std::chrono::steady_clock::time_point start;
 
-  Timing(const char *label) : label(label) {}
+  void begin() { start = std::chrono::steady_clock::now(); }
 
-  void begin() {
-    start = std::chrono::steady_clock::now();
-  }
-
-  void end() {
+  double end() {
     auto now = std::chrono::steady_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(now - start).count();
-    printf("%s: %.3f ms\n", label.c_str(), ms);
+    return std::chrono::duration<double, std::milli>(now - start).count();
   }
 };
 
@@ -72,15 +70,41 @@ struct metalcontext {
   id<MTLCommandQueue> queue;
   id<MTLLibrary> library;
 
+  id<MTLCounterSampleBuffer> sample_buffer = nil;
+  double gpu_ts_to_ns = 1.0;
+  NSUInteger next_sample_idx = 0;
+
   std::vector<launch> pending_kernels;
 
   std::unordered_map<std::string, id<MTLComputePipelineState>> pipeline_cache;
   std::unordered_map<std::string, id<MTLFunction>> fn_cache;
 
+  std::vector<std::pair<std::string, std::pair<NSUInteger,NSUInteger>>> profile_entries;
+
   void init() {
     device = MTLCreateSystemDefaultDevice();
     NSLog(@"using device %@", [device name]);
     queue = [device newCommandQueue];
+
+    if (profiling_enabled) {
+      MTLTimestamp cpu0, gpu0, cpu1, gpu1;
+      [device sampleTimestamps:&cpu0 gpuTimestamp:&gpu0];
+      [device sampleTimestamps:&cpu1 gpuTimestamp:&gpu1];
+      double ratio = double(cpu1 - cpu0) / double(gpu1 - gpu0);
+      mach_timebase_info_data_t info;
+      mach_timebase_info(&info);
+      gpu_ts_to_ns = ratio * info.numer / info.denom;
+
+      MTLCounterSampleBufferDescriptor *desc = [MTLCounterSampleBufferDescriptor new];
+      desc.counterSet = [[device counterSets] firstObject];
+      desc.storageMode = MTLStorageModeShared;
+      desc.sampleCount = 512;
+      NSError *err = nil;
+      sample_buffer = [device newCounterSampleBufferWithDescriptor:desc error:&err];
+      if (!sample_buffer) {
+        NSLog(@"failed to create sample buffer: %@", err);
+      }
+    }
 
     NSString *src = [NSString stringWithContentsOfFile:@"./fast/kernels.metal" encoding:NSUTF8StringEncoding error:nil];
 
@@ -121,20 +145,68 @@ struct metalcontext {
     return p;
   }
 
-  void run_all() {
-    id<MTLCommandBuffer> cmd = [queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+void run_all() {
+  id<MTLCommandBuffer> cmd = [queue commandBuffer];
+  id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
-    for (auto &k : pending_kernels) {
+  if (profiling_enabled) {
+    next_sample_idx = 0;
+    profile_entries.clear();
+  }
+
+  for (auto &k : pending_kernels) {
+    if (profiling_enabled) {
+      NSUInteger s = next_sample_idx++;
+      [enc sampleCountersInBuffer:sample_buffer
+                     atSampleIndex:s
+                       withBarrier:YES];
+
+      k.pipeline = get_pipeline(k.name);
+      k.encode(enc);
+
+      NSUInteger e = next_sample_idx++;
+      [enc sampleCountersInBuffer:sample_buffer
+                     atSampleIndex:e
+                       withBarrier:YES];
+
+      profile_entries.emplace_back(std::make_pair(
+        std::string(k.name), std::make_pair(s, e)));
+    } else {
       k.pipeline = get_pipeline(k.name);
       k.encode(enc);
     }
-
-    [enc endEncoding];
-    [cmd commit];
-    [cmd waitUntilCompleted];
-    pending_kernels.clear();
   }
+
+  [enc endEncoding];
+  [cmd commit];
+  [cmd waitUntilCompleted];
+  pending_kernels.clear();
+
+  if (profiling_enabled) {
+    // create result buffer to store resolved timestamps
+    id<MTLBuffer> result_buf = [device newBufferWithLength:
+      sizeof(MTLCounterResultTimestamp) * next_sample_idx
+      options:MTLStorageModeShared];
+
+    id<MTLCommandBuffer> rcmd = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [rcmd blitCommandEncoder];
+    [blit resolveCounters:sample_buffer
+                 inRange:NSMakeRange(0, next_sample_idx)
+        destinationBuffer:result_buf
+       destinationOffset:0];
+    [blit endEncoding];
+    [rcmd commit];
+    [rcmd waitUntilCompleted];
+
+    auto results = (const MTLCounterResultTimestamp *)result_buf.contents;
+    for (auto &pe : profile_entries) {
+      uint64_t t0 = results[pe.second.first].timestamp;
+      uint64_t t1 = results[pe.second.second].timestamp;
+      double ms = double(t1 - t0) * gpu_ts_to_ns * 1e-6;
+      printf("kernel %s: %.3f ms\n", pe.first.c_str(), ms);
+    }
+  }
+}
 
   id<MTLBuffer> to_cpu(id<MTLBuffer> buf) {
     id<MTLBuffer> shared = alloc(buf.length);
@@ -411,7 +483,7 @@ void run_one(model &m, MNIST &dataset, float lr) {
     uint total_batches = MNIST::TRAIN_CT / batch_size;
     uint total_samples = total_batches * batch_size;
 
-    Timing timer("epoch");
+    Timing timer;
     timer.begin();
     for (uint32_t batch = 0; batch < total_batches; ++batch) {
         Batch b = get_batch(batch);
@@ -420,8 +492,7 @@ void run_one(model &m, MNIST &dataset, float lr) {
         for (int i = 0; i < batch_size; ++i)
             sum += loss_cpu[i];
     }
-    timer.end();
-    printf("epoch loss: %f\n", sum / total_samples);
+    printf("epoch loss: %f, took %fms\n", sum / total_samples, timer.end());
 }
 
 void train(model &m, MNIST &dataset, uint epoch) {
