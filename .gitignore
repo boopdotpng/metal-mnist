@@ -3,3 +3,4 @@ main
 mnist
 main.dSYM
 *.trace
+.vscode
