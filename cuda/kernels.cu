@@ -1,6 +1,3 @@
-#include <cuda_runtime.h>
-#include <math_constants.h>
-
 // forward pass: matmul + bias + relu
 __global__ void matmul_bias_relu(
     const float* input,

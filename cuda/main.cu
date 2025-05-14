@@ -4,8 +4,8 @@
 #include <iostream>
 #include <vector>
 #include <random>
-#include <cuda_runtime.h>
 #include <chrono>
+#include <cuda_runtime.h>   // for cudaGraph API
 
 const uint32_t batch_size = 500;
 cudaStream_t stream;
@@ -13,12 +13,12 @@ cudaStream_t stream;
 struct dims { uint32_t batch, din, dout; };
 
 struct Timing {
-  std::string label;
   std::chrono::steady_clock::time_point start;
   void begin() { start = std::chrono::steady_clock::now(); }
   double end() {
-    auto now = std::chrono::steady_clock::now();
-    return std::chrono::duration<double, std::milli>(now - start).count();
+    return std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - start
+    ).count();
   }
 };
 
@@ -34,10 +34,9 @@ inline int calc_blocks(int total, int per_block = 256) {
 template<typename T>
 T* gpu_alloc(size_t count) {
   T* ptr = nullptr;
-  cudaMalloc(&ptr, count * sizeof(T));  // error handling removed
+  cudaMalloc(&ptr, count * sizeof(T));
   return ptr;
 }
-
 
 struct MNIST {
   static constexpr unsigned IMG_PIXELS = 28u * 28u;
@@ -239,58 +238,63 @@ struct model {
     size_t y_offset = size_t(bidx) * batch_size;
 
     l1.input        = data.x_train + x_offset;
-    l2.input        = l1.forward(); 
-    l3.input        = l2.forward(); 
+    l2.input        = l1.forward();
+    l3.input        = l2.forward();
     loss_module.logits = l3.forward();
     loss_module.labels = data.y_train + y_offset;
   }
-
-  float* run(int bidx, float lr, MNIST& data) {
-    set_batch(bidx, data);
-    l1.zero_grad(); l2.zero_grad(); l3.zero_grad();
-
-    loss_module.forward();
-    float* d1 = loss_module.backward();
-    float* d2 = l3.backward(d1);
-    float* d3 = l2.backward(d2);
-    (void)l1.backward(d3);
-
-    l1.update(lr);
-    l2.update(lr);
-    l3.update(lr);
-
-    cudaStreamSynchronize(stream);
-    return loss_module.loss();
-  }
 };
 
-void run_one(model& m, MNIST& data, float lr) {
-  double sum = 0.0;
-  int total_batches = MNIST::TRAIN_CT / batch_size;
-  std::vector<float> host_loss(batch_size);
+void capture_epoch_graph(cudaGraph_t &graph, cudaGraphExec_t &instance,
+                         model &m, MNIST &data) {
+  const int total_batches = MNIST::TRAIN_CT / batch_size;
 
-  Timing t; 
-  t.begin();
+  cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+
   for (int b = 0; b < total_batches; ++b) {
-    float* dev_loss = m.run(b, lr, data);
-    cudaMemcpyAsync(host_loss.data(), dev_loss, batch_size * sizeof(float), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-    for (float v : host_loss) sum += v;
+    m.set_batch(b, data);
+    m.l1.zero_grad(); m.l2.zero_grad(); m.l3.zero_grad();
+
+    m.loss_module.forward();
+    float *d1 = m.loss_module.backward();
+    float *d2 = m.l3.backward(d1);
+    float *d3 = m.l2.backward(d2);
+    (void)m.l1.backward(d3);
+
+    m.l1.update(0.01f);
+    m.l2.update(0.01f);
+    m.l3.update(0.01f);
   }
-  std::printf("epoch loss: %f, took %fms\n", sum / (total_batches * batch_size), t.end());
+
+  cudaStreamEndCapture(stream, &graph);
+  cudaGraphInstantiate(&instance, graph, nullptr, nullptr, 0);
 }
 
 int main() {
+  cudaSetDevice(0);
+  cudaStreamCreate(&stream);
+
   MNIST dataset;
   dataset.init();
 
   model m;
   m.init();
 
-  const float lr = 0.01f;
-  for (int e = 0; e < 10; ++e) {
-    run_one(m, dataset, lr);
+  cudaGraph_t     epochGraph     = nullptr;
+  cudaGraphExec_t epochInstance  = nullptr;
+  capture_epoch_graph(epochGraph, epochInstance, m, dataset);
+
+  const int epochs = 10;
+  for (int e = 0; e < epochs; ++e) {
+    Timing t; t.begin();
+    cudaGraphLaunch(epochInstance, stream);
+    cudaStreamSynchronize(stream);
+    std::printf("epoch %d finished in %f ms\n", e, t.end());
   }
-  cudaDeviceSynchronize();
+
+  cudaGraphExecDestroy(epochInstance);
+  cudaGraphDestroy(epochGraph);
+  cudaStreamDestroy(stream);
+
   return 0;
 }

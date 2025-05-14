@@ -2,8 +2,11 @@ CXX = clang++
 CXXFLAGS = -std=c++17 -ObjC++ -fobjc-arc
 INCLUDES = -I metal-cpp
 FRAMEWORKS = -framework Metal -framework Foundation
+
+ARCH = -gencode=arch=compute_120,code=sm_120  
 NVCC = nvcc
-NVCCFLAGS = -std=c++17
+NVCCFLAGS = $(ARCH) -std=c++17 -O3 -use_fast_math -Wno-deprecated-gpu-targets
+
 CUDA_SRC = cuda/main.cu cuda/kernels.cu
 
 ifeq ($(RELEASE),1)
@@ -25,7 +28,7 @@ slow: slow/main.mm
 	$(CXX) $(CXXFLAGS) $< $(INCLUDES) $(FRAMEWORKS) $(OPTFLAGS) -o $(TARGET)
 
 cuda:
-	cd cuda && nvcc -std=c++17 -Wno-deprecated-gpu-targets main.cu -o ../main
+	cd cuda && $(NVCC) $(NVCCFLAGS) main.cu -o ../main
 
 clean:
 	rm -f $(TARGET)
